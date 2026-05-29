@@ -306,7 +306,12 @@ async def update_product(
             # Load existing visual embedding from DB
             emb_res = client.table("product_embeddings").select("visual_embedding").eq("product_id", product_id).single().execute()
             if emb_res.data and "visual_embedding" in emb_res.data:
-                visual_embedding = np.array(emb_res.data["visual_embedding"])
+                import json
+                raw_emb = emb_res.data["visual_embedding"]
+                if isinstance(raw_emb, str):
+                    visual_embedding = np.array(json.loads(raw_emb), dtype=np.float32)
+                else:
+                    visual_embedding = np.array(raw_emb, dtype=np.float32)
             else:
                 # If visual embedding is somehow missing, fall back to encoding existing image
                 resp = requests.get(existing_product["image_url"], timeout=30)
