@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+supabase
+google-genai
+Pillow
+numpy
+open-clip-torch
+httpx
+pydantic
+pydantic-settings
+datasets
