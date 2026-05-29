@@ -200,6 +200,77 @@ Response:"""
                     pass
             raise
 
+    async def enrich_product_metadata(self, image_bytes: bytes) -> dict:
+        """
+        Extract structured search metadata (color_family, color_aliases, garment_type, search_tags)
+        from a product image. Falls back to OpenRouter Qwen if Gemini rate limits.
+        """
+        from pydantic import BaseModel
+        import json
+        
+        class CatalogEnrichment(BaseModel):
+            color_family: str
+            color_aliases: str
+            garment_type: str
+            search_tags: str
+            
+        prompt = """You are a fashion product analyst. Look at this product image and extract the following structured attributes:
+
+1. "color_family": Select the single best matching primary color family from this list: ["black", "white", "blue", "red", "green", "yellow", "orange", "purple", "pink", "brown", "grey", "teal", "khaki", "gold", "silver"]. It must be a single word from this list.
+2. "color_aliases": A comma-separated list of synonyms and descriptive color names a shopper might type (e.g. for a mint green sweater, this might be "seafoam, mint, sage, celadon, aqua mint, pale teal, soft green"). Provide 5-8 descriptive color synonyms representing the exact shade.
+3. "garment_type": The precise, specific garment type. For example, "double-breasted knee-length wool blend coat with lapel collar" or "crew neck knitted pullover sweater". Be extremely precise and structural.
+4. "search_tags": 12-15 comma-separated phrases a shopper would type to search for this product (e.g. "mint green sweater, men winter knit, warm cozy pullover, seafoam knitwear, casual sweater, winter crewneck, pastel green pullover"). Do NOT use any brand names. Ensure to include colors, garment type, fit, season, occasion, texture, and neckline.
+
+Respond with a JSON object containing these keys exactly:
+"color_family", "color_aliases", "garment_type", "search_tags"."""
+
+        # Try Gemini 2.5 Flash first
+        try:
+            pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            response = self.client.models.generate_content(
+                model=self.model_id,
+                contents=[prompt, pil_image],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CatalogEnrichment,
+                    temperature=0.0
+                ),
+            )
+            data = json.loads(response.text.strip())
+            if all(k in data for k in ["color_family", "color_aliases", "garment_type", "search_tags"]):
+                return data
+        except Exception as e:
+            error_str = str(e).lower()
+            if not ("429" in error_str or "resource" in error_str or "quota" in error_str):
+                raise
+
+        # Fallback to OpenRouter (Qwen)
+        try:
+            from app.services.openrouter_service import get_openrouter_service
+            or_svc = get_openrouter_service()
+            if or_svc.api_key:
+                response_text = await or_svc.chat_with_image(prompt, image_bytes, temperature=0.0)
+                response_text = response_text.strip()
+                
+                # Clean up potential markdown fences
+                if response_text.startswith("```json"):
+                    response_text = response_text[7:]
+                elif response_text.startswith("```"):
+                    response_text = response_text[3:]
+                if response_text.endswith("```"):
+                    response_text = response_text[:-3]
+                    
+                response_text = response_text.strip()
+                data = json.loads(response_text)
+                if all(k in data for k in ["color_family", "color_aliases", "garment_type", "search_tags"]):
+                    return data
+                else:
+                    raise ValueError("Parsed JSON missing keys")
+            else:
+                raise ValueError("OpenRouter API key is not configured")
+        except Exception as fallback_err:
+            raise RuntimeError(f"Both Gemini and Qwen fallback failed for product metadata enrichment: {fallback_err}")
+
 
 
 @lru_cache()

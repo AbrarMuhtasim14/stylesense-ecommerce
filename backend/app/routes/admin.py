@@ -78,16 +78,20 @@ async def upload_product(
             detail=f"Gemini AI Service Error: {error_msg}"
         )
 
-    # Step 3: Generate CLIP embeddings
+    # Step 3: Generate metadata enrichment using Gemini vision (with Qwen fallback)
+    metadata = await gemini_svc.enrich_product_metadata(image_bytes)
+
+    # Step 4: Generate CLIP embeddings using Search v2.0 design (0.6 * image + 0.4 * search_tags, normalized)
+    import numpy as np
     clip_svc = get_clip_service()
     visual_embedding = clip_svc.encode_image(image_bytes)
-    text_for_embedding = f"{visual_description} {color or ''} {category}"
-    text_embedding = clip_svc.encode_text(text_for_embedding)
-    combined_embedding = clip_svc.combine_embeddings(
-        visual_embedding, text_embedding, image_weight=settings.image_weight
-    )
+    text_embedding = clip_svc.encode_text(metadata["search_tags"])
+    combined_embedding = 0.6 * visual_embedding + 0.4 * text_embedding
+    norm = np.linalg.norm(combined_embedding)
+    if norm > 1e-8:
+        combined_embedding = combined_embedding / norm
 
-    # Step 4: Insert product into database
+    # Step 5: Insert product into database including the 4 new search metadata columns
     client = get_supabase_client()
 
     product_data = {
@@ -102,12 +106,16 @@ async def upload_product(
         "season": season,
         "usage_type": usage_type,
         "image_url": image_url,
+        "color_family": metadata["color_family"].strip().lower(),
+        "color_aliases": metadata["color_aliases"].strip(),
+        "garment_type": metadata["garment_type"].strip(),
+        "search_tags": metadata["search_tags"].strip(),
     }
 
     product_result = client.table("products").insert(product_data).execute()
     product = product_result.data[0]
 
-    # Step 5: Insert embeddings
+    # Step 6: Insert embeddings
     embedding_data = {
         "product_id": product["id"],
         "visual_embedding": visual_embedding.tolist(),
@@ -231,6 +239,18 @@ async def update_product(
                     detail=f"Gemini AI Service Error: {error_msg}"
                 )
         
+        # Generate new search metadata
+        try:
+            gemini_svc = GeminiService()
+            metadata = await gemini_svc.enrich_product_metadata(image_bytes)
+            updates["color_family"] = metadata["color_family"].strip().lower()
+            updates["color_aliases"] = metadata["color_aliases"].strip()
+            updates["garment_type"] = metadata["garment_type"].strip()
+            updates["search_tags"] = metadata["search_tags"].strip()
+        except Exception as e:
+            # Let it propagate or log
+            pass
+        
         # Encode new image bytes with CLIP visual encoder
         clip_svc = get_clip_service()
         visual_embedding = clip_svc.encode_image(image_bytes)
@@ -266,16 +286,20 @@ async def update_product(
     )
     
     if image_uploaded or regenerate_description or text_fields_changed:
-        # Get latest text values
-        final_desc = updates.get("visual_description") or existing_product.get("visual_description") or ""
-        final_color = updates.get("color") if "color" in updates else existing_product.get("color") or ""
-        final_category = updates.get("category") if "category" in updates else existing_product.get("category") or ""
+        # Get latest text values (search_tags)
+        final_tags = updates.get("search_tags") or existing_product.get("search_tags") or ""
         
+        if not final_tags:
+            # Fallback compile if metadata not yet generated
+            final_desc = updates.get("visual_description") or existing_product.get("visual_description") or ""
+            final_color = updates.get("color") if "color" in updates else existing_product.get("color") or ""
+            final_category = updates.get("category") if "category" in updates else existing_product.get("category") or ""
+            final_tags = f"{final_desc} {final_color} {final_category}"
+            
         clip_svc = get_clip_service()
         
         # Encode new text vector
-        text_for_embedding = f"{final_desc} {final_color} {final_category}"
-        text_embedding = clip_svc.encode_text(text_for_embedding)
+        text_embedding = clip_svc.encode_text(final_tags)
         
         # Get latest visual vector
         if visual_embedding is None:
@@ -289,10 +313,11 @@ async def update_product(
                 resp.raise_for_status()
                 visual_embedding = clip_svc.encode_image(resp.content)
         
-        # Combine embeddings
-        combined_embedding = clip_svc.combine_embeddings(
-            visual_embedding, text_embedding, image_weight=settings.image_weight
-        )
+        # Combine embeddings using 0.6 / 0.4 normalized
+        combined_embedding = 0.6 * visual_embedding + 0.4 * text_embedding
+        norm = np.linalg.norm(combined_embedding)
+        if norm > 1e-8:
+            combined_embedding = combined_embedding / norm
         
         # Update product_embeddings
         emb_update = {
